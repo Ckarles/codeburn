@@ -149,6 +149,15 @@ describe.skipIf(!isSqliteAvailable())('maybeSyncCursor', () => {
     expect(f).toHaveBeenCalledTimes(1)
   })
 
+  it('records the socket error behind a fetch failure', async () => {
+    const cause = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET', syscall: 'read' })
+    const f = vi.fn(async () => { throw new TypeError('fetch failed', { cause }) })
+    expect(await maybeSyncCursor({ now: NOW, fetchImpl: f as unknown as typeof fetch })).toBeNull()
+    expect(f).toHaveBeenCalledTimes(1)
+    expect((await state()).lastError).toBe('fetch failed (ECONNRESET)')
+    expect((await state()).failures).toBe(1)
+  })
+
   it('a 5xx, a network error or a foreign body keeps the stored usage; three in a row back off 6 hours', async () => {
     await maybeSyncCursor({ now: NOW, fetchImpl: fakeFetch() })
     const before = await readFile(cursorImportPath(), 'utf-8')

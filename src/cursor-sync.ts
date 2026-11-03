@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'crypto'
 import { existsSync } from 'fs'
 import { mkdir, readFile, rename, writeFile } from 'fs/promises'
 import { dirname, join } from 'path'
+import { Agent } from 'undici'
 
 import { getCodeburnCacheDir } from './cache-dir.js'
 import { readConfig } from './config.js'
@@ -90,6 +91,56 @@ const STATUS_ERRORS = {
   export: "Couldn't read the usage export from cursor.com, will retry",
   locked: cursorLockedMessage(),
 } as const
+
+// A tunnel (Cloudflare WARP, in particular) RSTs an idle keep-alive socket.
+// undici then hands that dead socket to the next request and rejects with
+// `TypeError: fetch failed`, whose cause carries the real code. A fresh agent
+// per attempt never reuses it; one retry covers a reset that lands on the
+// attempt itself.
+const TRANSIENT_SOCKET = /^(?:ECONNRESET|ECONNREFUSED|EPIPE|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT|UND_ERR_CLOSED|UND_ERR_ABORTED)$/
+
+function cursorExportSocketCode(error: unknown): string | null {
+  if (!(error instanceof Error) || error.cause === null || typeof error.cause !== 'object') return null
+  const code = 'code' in error.cause && typeof error.cause.code === 'string' ? error.cause.code : ''
+  return TRANSIENT_SOCKET.test(code) ? code : null
+}
+
+function syncFailure(error: unknown): string {
+  const message = sanitizeError(error).split('\n')[0]!
+  const code = cursorExportSocketCode(error)
+  if (!code || message.includes(code)) return message
+  return `${message} (${code})`.slice(0, 240)
+}
+
+async function fetchUsageExport(url: string, headers: Record<string, string>, timeoutMs: number, fetchImpl?: typeof fetch): Promise<Response> {
+  if (fetchImpl) return fetchImpl(url, { method: 'GET', headers, signal: AbortSignal.timeout(timeoutMs) })
+
+  const once = async (): Promise<Response> => {
+    // A private agent, not the process-wide pool. The menu bar also calls
+    // cursor.com for quota, and a tunnel reset of that shared socket is what
+    // makes the next export fail before it is sent.
+    const agent = new Agent({ keepAliveTimeout: 1, keepAliveMaxTimeout: 1, connections: 1, pipelining: 1 })
+    try {
+      const res = await globalThis.fetch(url, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(timeoutMs),
+        dispatcher: agent,
+      } as RequestInit & { dispatcher: Agent })
+      // Buffer before close. Closing the agent first kills the body stream.
+      const body = await res.text()
+      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers })
+    } finally {
+      await agent.close().catch(() => {})
+    }
+  }
+  try {
+    return await once()
+  } catch (error) {
+    if (!cursorExportSocketCode(error)) throw error
+    return once()
+  }
+}
 
 function statusErrorCode(lastError: string): keyof typeof STATUS_ERRORS {
   if (/Safe Storage|encrypted its app session/.test(lastError)) return 'locked'
@@ -245,11 +296,12 @@ export async function maybeSyncCursor(opts: { force?: boolean; now?: number; fet
     const othersEnd = Math.max(-Infinity, ...(store?.ranges.filter(r => r.source === 'sync' && r.account !== account).map(r => Date.parse(r.end)) ?? []))
     const backfill = !Number.isFinite(through)
     const from = Math.max(backfill ? firstSyncStart(now) : previousLocalDayStart(through), othersEnd + 1)
-    const res = await (opts.fetchImpl ?? globalThis.fetch)(`${EXPORT_URL}?startDate=${from}&endDate=${now}&strategy=tokens`, {
-      method: 'GET',
-      headers: { Accept: 'text/csv', Cookie: cookie, Origin: 'https://cursor.com', 'User-Agent': 'CodeBurn' },
-      signal: AbortSignal.timeout(force ? FORCED_TIMEOUT_MS : backfill ? BACKFILL_TIMEOUT_MS : TIMEOUT_MS),
-    })
+    const res = await fetchUsageExport(
+      `${EXPORT_URL}?startDate=${from}&endDate=${now}&strategy=tokens`,
+      { Accept: 'text/csv', Cookie: cookie, Origin: 'https://cursor.com', 'User-Agent': 'CodeBurn' },
+      force ? FORCED_TIMEOUT_MS : backfill ? BACKFILL_TIMEOUT_MS : TIMEOUT_MS,
+      opts.fetchImpl,
+    )
     if (res.status === 401 || res.status === 403) {
       const lastError = `Cursor rejected the app session (HTTP ${res.status}); open Cursor and sign in again`
       await fail(lastError, now + REJECTED_BACKOFF_MS, claims.exp)
@@ -274,7 +326,7 @@ export async function maybeSyncCursor(opts: { force?: boolean; now?: number; fet
     return summary
   } catch (err) {
     // Only the first line: a header mismatch quotes the response body below it.
-    const message = err instanceof Skip ? err.message : sanitizeError(err).split('\n')[0]!
+    const message = err instanceof Skip ? err.message : syncFailure(err)
     if (attempt && !(err instanceof Skip)) await fail(message).catch(() => {})
     if (force) throw new Error(message)
     return null
